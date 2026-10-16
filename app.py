@@ -12,7 +12,11 @@ import requests
 import base64
 from pathlib import Path
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Server 行 UTC，日期一定要用香港時間計，唔係半夜 12 點至朝早 8 點會早一日
+HK_TZ = ZoneInfo("Asia/Hong_Kong")
 
 st.set_page_config(page_title="壁球場剩位查詢", layout="centered")
 
@@ -193,12 +197,23 @@ def fetch_all(play_dates):
 
 
 # ---------------- 抓數據 ----------------
-dates = [(date.today() + timedelta(days=i)).isoformat() for i in range(8)]
+today_hk = datetime.now(HK_TZ).date()
+dates = [(today_hk + timedelta(days=i)).isoformat() for i in range(8)]
 weekdays = ["一", "二", "三", "四", "五", "六", "日"]
 
 with st.spinner("問緊 SmartPLAY 攞最新剩位…"):
     all_data = fetch_all(tuple(dates))
-    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    fetched_at = datetime.now(HK_TZ).strftime("%Y-%m-%d %H:%M")
+
+# 防禦：SmartPLAY 有時會 block 自動查詢（尤其朝早 7 點搶場高峰期），
+# 攞唔到數據唔好炸 app，顯示提示＋重試掣
+if sum(len(v) for v in all_data.values()) == 0:
+    fetch_all.clear()  # 清走空結果嘅 cache，重試嗰陣先會真係再問過
+    st.error("⚠️ 而家問唔到 SmartPLAY 攞數據，佢哋嘅防禦系統暫時 block 咗自動查詢（朝早 7 點搶場高峰期成日會咁）。")
+    st.info("💡 請直接用官方 SmartPLAY app 睇剩位，或者等多陣撳下面再試一次。")
+    if st.button("🔄 再試一次"):
+        st.rerun()
+    st.stop()
 
 # ---------------- 選擇器（跟 v1 流程） ----------------
 dist_names = [name for _, name in DISTRICTS]
@@ -206,9 +221,13 @@ dist_default = dist_names.index("深水埗區")
 dist_choice = st.selectbox("揀分區", dist_names, index=dist_default)
 dist_code = DISTRICTS[dist_names.index(dist_choice)][0]
 
-all_venues = sorted(
-    (v for v in all_data.get(dates[0], []) if v["distCode"] == dist_code),
-    key=lambda v: v["name"])
+# 場館名單由 8 日數據合併（唔淨係靠今日，驚個別日子 request 失敗）
+seen = {}
+for d in dates:
+    for v in all_data.get(d, []):
+        if v["distCode"] == dist_code:
+            seen.setdefault(v["key"], v)
+all_venues = sorted(seen.values(), key=lambda v: v["name"])
 venue_names = [v["name"] for v in all_venues]
 
 choice = st.selectbox(
