@@ -215,27 +215,7 @@ if sum(len(v) for v in all_data.values()) == 0:
         st.rerun()
     st.stop()
 
-# ---------------- 選擇器（跟 v1 流程） ----------------
-dist_names = [name for _, name in DISTRICTS]
-dist_default = dist_names.index("深水埗區")
-dist_choice = st.selectbox("揀分區", dist_names, index=dist_default)
-dist_code = DISTRICTS[dist_names.index(dist_choice)][0]
-
-# 場館名單由 8 日數據合併（唔淨係靠今日，驚個別日子 request 失敗）
-seen = {}
-for d in dates:
-    for v in all_data.get(d, []):
-        if v["distCode"] == dist_code:
-            seen.setdefault(v["key"], v)
-all_venues = sorted(seen.values(), key=lambda v: v["name"])
-venue_names = [v["name"] for v in all_venues]
-
-choice = st.selectbox(
-    "揀場館", venue_names,
-    index=venue_names.index("歌和老街體育館") if "歌和老街體育館" in venue_names else 0,
-)
-venue_key = all_venues[venue_names.index(choice)]["key"]
-
+# ---------------- 日期（兩個模式共用） ----------------
 def _date_label(d):
     dt = date.fromisoformat(d)
     idx = dates.index(d)
@@ -248,50 +228,144 @@ def _date_label(d):
 
 display_dates = list(reversed(dates))  # 新日在前
 date_labels = [_date_label(d) for d in display_dates]
-day_choice = st.selectbox("揀日期", date_labels, index=0)  # 預設「明天預約」
-play_date = display_dates[date_labels.index(day_choice)]
-wd = weekdays[date.fromisoformat(play_date).weekday()]
 
-filter_choice = st.radio("篩選", ["全部", "有位", "已滿"], horizontal=True)
+def _date_banner(play_date):
+    """最遠可訂日／明天預約提示，兩個模式共用。"""
+    if play_date == dates[-2]:
+        nxt = date.fromisoformat(play_date) + timedelta(days=1)
+        st.info(f"💡 呢日係現時最遠可訂嘅日子，聽朝 7 點會開賣 {nxt.month}月{nxt.day}日。")
+    elif play_date == dates[-1]:
+        st.info("💡 呢日現時只可觀看，聽朝 7 點開賣後就可以預約（同官方 app 一樣）。")
 
-if play_date == dates[-2]:
-    nxt = date.fromisoformat(play_date) + timedelta(days=1)
-    st.info(f"💡 呢日係現時最遠可訂嘅日子，聽朝 7 點會開賣 {nxt.month}月{nxt.day}日。")
-elif play_date == dates[-1]:
-    st.info("💡 呢日現時只可觀看，聽朝 7 點開賣後就可以預約（同官方 app 一樣）。")
+def _on_dist_change():
+    # 轉區之後，舊嘅場館選擇可能唔喺新區個 list 入面，清走佢等佢用返預設
+    st.session_state.pop("single_venue", None)
 
-# ---------------- 場館資訊卡 ----------------
-venue = next((v for v in all_data.get(play_date, []) if v["key"] == venue_key), None)
+def _jump_to_venue(dist, venue_name, date_label):
+    # 注意：一定要經 on_click callback 嚟 set session_state！
+    # callback 喺 script 重跑「之前」執行，嗰陣 widget 未起好，set 乜都得；
+    # 如果喺 script 主體（mode 個 radio 已經起好之後）先 set，就會炸
+    # StreamlitAPIException: cannot be modified after the widget is instantiated
+    st.session_state["mode"] = "🔍 查單間場館"
+    st.session_state["single_dist"] = dist
+    st.session_state["single_venue"] = venue_name
+    st.session_state["single_date"] = date_label
 
-if venue is None:
-    st.error("搵唔到呢間場館嘅資料。")
+# Widget 預設值初始化（每個 browser session 只做一次）：
+# 之後啲 widget 唔再傳 index= default，全部經 session_state 攞值。
+# 咁 jump 嗰陣 set 值就唔會同 default 打架，唔會再出
+# "created with a default value but also had its value set via the Session State API" warning。
+if "mode" not in st.session_state:
+    st.session_state["mode"] = "🔍 查單間場館"
+if "single_dist" not in st.session_state:
+    st.session_state["single_dist"] = "深水埗區"
+
+# ---------------- 模式切換 ----------------
+mode = st.radio("模式", ["🔍 查單間場館", "🏆 全港剩位排名"], horizontal=True, key="mode")
+
+if mode == "🏆 全港剩位排名":
+    # 排名唔使再問 API：all_data 已經有齊 8 日 × 76 間，淨係排序
+    day_choice = st.selectbox("揀日期", date_labels, index=0, key="rank_date")
+    play_date = display_dates[date_labels.index(day_choice)]
+    wd = weekdays[date.fromisoformat(play_date).weekday()]
+    _date_banner(play_date)
+    scope = st.selectbox("排名範圍", ["全港"] + [name for _, name in DISTRICTS],
+                         index=0, key="rank_scope")
+    venues = all_data.get(play_date, [])
+    if scope != "全港":
+        # list comprehension：淨係要啱區嘅場館
+        venues = [v for v in venues if v["dist"] == scope]
+    ranked = sorted(venues, key=lambda v: v["day_total"], reverse=True)
+    st.markdown(f"### 🏆 {play_date}（星期{wd}）・{scope}剩位排名")
+    if not ranked:
+        st.info("呢日暫時冇數據。")
+    medals = ["🥇", "🥈", "🥉"]
+    for i, v in enumerate(ranked, 1):
+        tag = medals[i - 1] if i <= 3 else f"{i}."
+        p = v["periods"]
+        m = p.get("morning", {}).get("total", 0)
+        a = p.get("afternoon", {}).get("total", 0)
+        e = p.get("evening", {}).get("total", 0)
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.markdown(
+                f'<div class="card"><span>{tag} <b>{v["name"]}・{v["dist"]}</b>'
+                f'<br><small>早 {m}・午 {a}・晚 {e} 場</small></span>'
+                f'<span class="pill avail">全日 {v["day_total"]} 場</span></div>',
+                unsafe_allow_html=True)
+        with c2:
+            # 墊返少少，等個掣同隔籬綠色 pill 垂直對齊
+            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+            st.button("詳情", key=f"goto_{v['key']}_{play_date}",
+                      on_click=_jump_to_venue,
+                      args=(v["dist"], v["name"], _date_label(play_date)),
+                      help=f"睇{v['name']}喺{play_date}嘅全日詳情")
 else:
-    st.markdown(f"""
-    <div class="venue-bar">
-      <div class="venue">{venue["name"]}</div>
-      <div class="date">{play_date}（星期{wd}）・{venue["region"]}・{venue["dist"]}</div>
-      <div class="day-total">全日可預約場次：{venue["day_total"]}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    # ---------------- 查單間場館（原有流程） ----------------
+    dist_names = [name for _, name in DISTRICTS]
+    dist_choice = st.selectbox("揀分區", dist_names,
+                               key="single_dist", on_change=_on_dist_change)
+    dist_code = DISTRICTS[dist_names.index(dist_choice)][0]
 
-    # ---------------- 三段時段（全部攤開） ----------------
-    for period_key, group_name, prefix in PERIODS:
-        pdata = venue["periods"].get(period_key, {"slots": [], "total": 0})
-        st.markdown(f'<div class="group-title">{group_name}（可預約 {pdata["total"]} 場次）</div>',
-                    unsafe_allow_html=True)
-        shown = 0
-        for start, end, n, avail in pdata["slots"]:
-            if filter_choice == "有位" and not avail:
-                continue
-            if filter_choice == "已滿" and avail:
-                continue
-            shown += 1
-            pill = (f'<span class="pill avail">可預約 {n} 場</span>'
-                    if avail else '<span class="pill full">已滿</span>')
-            st.markdown(f'<div class="card"><span>{prefix} {start} - {end}</span>{pill}</div>',
+    # 場館名單由 8 日數據合併（唔淨係靠今日，驚個別日子 request 失敗）
+    seen = {}
+    for d in dates:
+        for v in all_data.get(d, []):
+            if v["distCode"] == dist_code:
+                seen.setdefault(v["key"], v)
+    all_venues = sorted(seen.values(), key=lambda v: v["name"])
+    venue_names = [v["name"] for v in all_venues]
+
+    # 場館預設：歌和老街優先，唔喺呢區就用第一間；
+    # jump 過嚟嘅值如果啱用就保留，唔啱（或未 set 過）先至用預設
+    if st.session_state.get("single_venue") not in venue_names:
+        st.session_state["single_venue"] = (
+            "歌和老街體育館" if "歌和老街體育館" in venue_names else venue_names[0])
+    choice = st.selectbox("揀場館", venue_names, key="single_venue")
+    venue_key = all_venues[venue_names.index(choice)]["key"]
+    
+    if st.session_state.get("single_date") not in date_labels:
+        st.session_state["single_date"] = date_labels[0]  # 預設「明天預約」
+    day_choice = st.selectbox("揀日期", date_labels, key="single_date")
+    play_date = display_dates[date_labels.index(day_choice)]
+    wd = weekdays[date.fromisoformat(play_date).weekday()]
+    
+    filter_choice = st.radio("篩選", ["全部", "有位", "已滿"], horizontal=True)
+    
+    _date_banner(play_date)
+    
+    # ---------------- 場館資訊卡 ----------------
+    venue = next((v for v in all_data.get(play_date, []) if v["key"] == venue_key), None)
+
+    if venue is None:
+        st.error("搵唔到呢間場館嘅資料。")
+    else:
+        st.markdown(f"""
+        <div class="venue-bar">
+          <div class="venue">{venue["name"]}</div>
+          <div class="date">{play_date}（星期{wd}）・{venue["region"]}・{venue["dist"]}</div>
+          <div class="day-total">全日可預約場次：{venue["day_total"]}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ---------------- 三段時段（全部攤開） ----------------
+        for period_key, group_name, prefix in PERIODS:
+            pdata = venue["periods"].get(period_key, {"slots": [], "total": 0})
+            st.markdown(f'<div class="group-title">{group_name}（可預約 {pdata["total"]} 場次）</div>',
                         unsafe_allow_html=True)
-        if shown == 0:
-            st.write("呢個段節冇符合篩選嘅時段")
+            shown = 0
+            for start, end, n, avail in pdata["slots"]:
+                if filter_choice == "有位" and not avail:
+                    continue
+                if filter_choice == "已滿" and avail:
+                    continue
+                shown += 1
+                pill = (f'<span class="pill avail">可預約 {n} 場</span>'
+                        if avail else '<span class="pill full">已滿</span>')
+                st.markdown(f'<div class="card"><span>{prefix} {start} - {end}</span>{pill}</div>',
+                            unsafe_allow_html=True)
+            if shown == 0:
+                st.write("呢個段節冇符合篩選嘅時段")
 
 st.markdown(f"""
 <div class="footnote">
